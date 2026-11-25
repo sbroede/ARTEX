@@ -19,8 +19,10 @@ if (command === 'login' || command === 'status') {
   const host = process.env.CODEX_BRIDGE_HOST || '127.0.0.1';
   const port = Number(process.env.CODEX_BRIDGE_PORT || 8789);
   const maxConcurrent = Number(process.env.CODEX_BRIDGE_CONCURRENCY || 2);
+  const maxQueued = Number(process.env.CODEX_BRIDGE_QUEUE_SIZE || 16);
+  const queueTimeout = Number(process.env.CODEX_BRIDGE_QUEUE_TIMEOUT_MS || 120_000);
   const timeout = Number(process.env.CODEX_BRIDGE_TIMEOUT_MS || 300_000);
-  if (!Number.isInteger(port) || port < 1 || port > 65535 || !Number.isInteger(maxConcurrent) || maxConcurrent < 1 || !Number.isSafeInteger(timeout) || timeout < 1000) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535 || !Number.isInteger(maxConcurrent) || maxConcurrent < 1 || !Number.isInteger(maxQueued) || maxQueued < 0 || !Number.isSafeInteger(queueTimeout) || queueTimeout < 1 || !Number.isSafeInteger(timeout) || timeout < 1000) {
     throw new Error('Invalid bridge port, concurrency, or timeout');
   }
   let token = process.env.CODEX_BRIDGE_API_KEY;
@@ -38,7 +40,7 @@ if (command === 'login' || command === 'status') {
     }
     console.error(`Bridge API key file: ${tokenFile}`);
   }
-  const server = createBridge({ token, bin, home, maxConcurrent, timeout });
+  const server = createBridge({ token, bin, home, maxConcurrent, maxQueued, queueTimeout, timeout });
   server.on('error', error => { console.error(`Cannot listen: ${error.code || 'unknown error'}`); process.exitCode = 1; });
   server.listen(port, host, () => console.error(`ARTEX Codex Bridge: http://${host}:${port}/v1`));
   for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => {

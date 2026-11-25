@@ -1,7 +1,16 @@
 import { randomUUID } from 'node:crypto';
 
 export class HTTPError extends Error {
-  constructor(status, message) { super(message); this.status = status; }
+  constructor(status, message, code = status) { super(message); this.status = status; this.code = code; }
+}
+
+function codexFailure(error) {
+  if (error?.codexErrorInfo === 'cyberPolicy') {
+    return new HTTPError(403,
+      'Codex rejected this request under its cybersecurity policy (cyberPolicy). Check the security-research access available to your account.',
+      'cyber_policy');
+  }
+  return new Error('Codex failed to complete this request');
 }
 
 export function validateCompletion(body) {
@@ -50,6 +59,7 @@ export async function complete(rpc, body, { cwd, signal, timeout = 300_000, onDe
   let threadId;
   let answer = '';
   let usage;
+  let lastFailure;
   let settle;
   let rejectResult;
   const result = new Promise((resolve, reject) => { settle = resolve; rejectResult = reject; });
@@ -59,7 +69,7 @@ export async function complete(rpc, body, { cwd, signal, timeout = 300_000, onDe
     if (!threadId || p.threadId !== threadId) return;
     if (message.id != null && message.method === 'item/tool/call') {
       const name = toolNames.get(p.tool);
-      if (!name) { rejectResult(new Error('Codex requested an unknown tool')); return; }
+      if (!name) { rejectResult(new HTTPError(502, 'Codex requested an unknown ARTEX function')); return; }
       // Do not execute or acknowledge the call. Returning it to ARTEX ends this
       // inference; the owning HTTP handler closes the isolated app-server.
       settle({ content: answer || null, tool_calls: [{
@@ -69,7 +79,7 @@ export async function complete(rpc, body, { cwd, signal, timeout = 300_000, onDe
     } else if (message.id != null) {
       // Never grant built-in command, filesystem, connector or approval requests.
       try { rpc.send({ id: message.id, error: { code: -32601, message: 'Only ARTEX function calls are supported' } }); } catch {}
-      rejectResult(new Error('Codex requested a built-in tool; bridge execution is disabled'));
+      rejectResult(new HTTPError(502, `Codex requested an unsupported built-in tool (${message.method})`));
     } else if (message.method === 'item/agentMessage/delta') {
       answer += p.delta;
       onDelta(p.delta);
@@ -77,8 +87,11 @@ export async function complete(rpc, body, { cwd, signal, timeout = 300_000, onDe
       const u = p.tokenUsage?.total;
       if (u) usage = { prompt_tokens: u.inputTokens, completion_tokens: u.outputTokens, total_tokens: u.totalTokens,
         prompt_tokens_details: { cached_tokens: u.cachedInputTokens || 0 } };
+    } else if (message.method === 'error') {
+      lastFailure = p.error;
     } else if (message.method === 'turn/completed') {
-      if (p.turn.status !== 'completed') rejectResult(new Error(p.turn.error?.message || `Codex turn ${p.turn.status}`));
+      if (p.turn.status !== 'completed') rejectResult(codexFailure(p.turn.error?.codexErrorInfo ? p.turn.error : lastFailure || p.turn.error));
+      else if (!answer) rejectResult(new HTTPError(502, 'Codex returned no text or ARTEX function call'));
       else settle({ content: answer, finish_reason: 'stop', usage });
     }
   };

@@ -110,6 +110,9 @@ is the simplest setup path. Do not initiate CLI and HTTP login simultaneously.
 - Actual token usage is returned when Codex reports it. A tool-call response can
   arrive before usage is reported and then has **no usage object**. ARTEX token
   budgets may undercount these calls. No usage is fabricated.
+  With streaming, usage accompanies the final `finish_reason` chunk because
+  ARTEX's Norma reader may stop at that chunk. It is not sent in a later
+  `choices: []` chunk that the reader could miss.
 - Codex does not expose Chat Completions sampling or output-token controls here.
   `temperature`, `top_p`, penalties, `max_tokens`, and `max_completion_tokens` are
   accepted for ARTEX compatibility but **not enforced**. The response header
@@ -117,10 +120,20 @@ is the simplest setup path. Do not initiate CLI and HTTP login simultaneously.
   timeout/concurrency limits and account limits for operational bounds.
 - Images, audio, `stop`, logprobs, multiple choices, and forced tool choices are
   rejected. `/v1/responses`, embeddings and the other Platform API routes are not
-  implemented. SSE uses standard Chat Completions deltas and `[DONE]`; failures
-  after streaming starts are returned as an SSE `error` object.
-- Defaults: two concurrent workers, five-minute completion timeout, 16 MiB body
-  limit. Disconnected requests terminate their worker; overload returns 429.
+  implemented. SSE uses Chat Completions deltas and `[DONE]`. HTTP success headers
+  are delayed until real output or a successful tool call, so failures before
+  output reach ARTEX as non-2xx responses. Failures after partial output terminate
+  the stream without a successful `[DONE]`.
+- Codex cybersecurity policy rejections (`cyberPolicy`) return HTTP 403 with code
+  `cyber_policy`. They are not converted into empty successful answers. The bridge
+  does not alter task contents, switch models, or change safeguards to bypass a
+  service policy rejection. Account-specific security-research access must be
+  handled with the service provider.
+- Defaults: two concurrent workers, up to 16 waiting requests, two-minute queue
+  timeout, five-minute completion timeout, 16 MiB body limit. The planner and
+  workers can overlap without immediately hitting 429. A full queue returns 429;
+  an expired queue wait returns 503. Disconnected requests terminate their worker
+  or are removed from the queue before starting a Codex process.
 
 | Environment variable | Default |
 | --- | --- |
@@ -130,6 +143,8 @@ is the simplest setup path. Do not initiate CLI and HTTP login simultaneously.
 | `CODEX_BRIDGE_PORT` | `8789` |
 | `CODEX_BRIDGE_API_KEY` | Generated key file; minimum 32 characters |
 | `CODEX_BRIDGE_CONCURRENCY` | `2` |
+| `CODEX_BRIDGE_QUEUE_SIZE` | `16` (use `0` for immediate overload rejection) |
+| `CODEX_BRIDGE_QUEUE_TIMEOUT_MS` | `120000` |
 | `CODEX_BRIDGE_TIMEOUT_MS` | `300000` |
 
 ## Verification

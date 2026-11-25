@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexRPC } from './rpc.mjs';
 import { complete, validateCompletion, HTTPError } from './completion.mjs';
+import { WorkerQueue } from './queue.mjs';
 
 const json = (response, status, value) => {
   response.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
@@ -28,11 +29,13 @@ async function readJSON(request, limit) {
 }
 
 export function createBridge({ token, bin = 'codex', home, maxConcurrent = 2,
+  maxQueued = 16, queueTimeout = 120_000,
   timeout = 300_000, maxBody = 16 * 1024 * 1024,
   rpcFactory = options => new CodexRPC(options) } = {}) {
   if (typeof token !== 'string' || token.length < 32) throw new Error('CODEX_BRIDGE_API_KEY must contain at least 32 characters');
   if (!home) throw new Error('A dedicated CODEX_HOME is required');
-  let active = 0;
+  let admitted = 0;
+  const queue = new WorkerQueue(maxConcurrent, maxQueued, queueTimeout);
   let control;
   let initializing;
   const workers = new Set();
@@ -50,7 +53,8 @@ export function createBridge({ token, bin = 'codex', home, maxConcurrent = 2,
   const server = createServer(async (request, response) => {
     let rpc;
     let cwd;
-    let acquired = false;
+    let admittedRequest = false;
+    let release;
     let keepalive;
     const abort = new AbortController();
     response.once('close', () => { if (!response.writableEnded) { abort.abort(); rpc?.close(); } });
@@ -94,11 +98,13 @@ export function createBridge({ token, bin = 'codex', home, maxConcurrent = 2,
       }
       if (request.method !== 'POST' || path !== '/v1/chat/completions') throw new HTTPError(404, 'Endpoint not found');
       if (!request.headers['content-type']?.toLowerCase().startsWith('application/json')) throw new HTTPError(415, 'Use Content-Type: application/json');
-      if (active >= maxConcurrent) throw new HTTPError(429, 'Codex bridge is busy; retry later');
-      // Reserve before reading the body so slow clients also count toward the limit.
-      active++; acquired = true;
+      // Bound body readers as well as queued requests. Read before queuing so a
+      // waiting upload cannot hit Node's request-body timeout under backpressure.
+      if (admitted >= maxConcurrent + maxQueued) throw new HTTPError(429, 'Codex bridge queue is full; retry later');
+      admitted++; admittedRequest = true;
       const body = await readJSON(request, maxBody);
       validateCompletion(body);
+      release = await queue.acquire(abort.signal);
       if (abort.signal.aborted) throw new HTTPError(499, 'Request cancelled');
       cwd = await mkdtemp(join(tmpdir(), 'artex-codex-'));
       rpc = rpcFactory({ bin, home, cwd });
@@ -117,20 +123,23 @@ export function createBridge({ token, bin = 'codex', home, maxConcurrent = 2,
         if (!response.destroyed) response.write(`data: ${JSON.stringify({ ...base, object: 'chat.completion.chunk',
           choices: [{ index: 0, delta, finish_reason }], ...(usage ? { usage } : {}) })}\n\n`);
       };
-      if (body.stream) {
+      const startStream = () => {
+        if (response.headersSent) return;
         response.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' });
         chunk({ role: 'assistant', content: '' });
         keepalive = setInterval(() => { if (!response.destroyed) response.write(': keepalive\n\n'); }, 15_000);
-      }
+      };
       const output = await complete(rpc, body, { cwd, signal: abort.signal, timeout,
-        onDelta: delta => { if (body.stream) chunk({ content: delta }); },
+        onDelta: delta => { if (body.stream && delta) { startStream(); chunk({ content: delta }); } },
       });
       if (body.stream) {
+        // Do not send HTTP 200 until actual content or a successful tool result.
+        // ARTEX's OpenAI reader can otherwise treat a later SSE error as success.
+        startStream();
         if (output.tool_calls) chunk({ tool_calls: output.tool_calls.map((call, index) => ({ index, ...call })) });
-        chunk({}, output.finish_reason);
-        if (body.stream_options?.include_usage && output.usage && !response.destroyed) {
-          response.write(`data: ${JSON.stringify({ ...base, object: 'chat.completion.chunk', choices: [], usage: output.usage })}\n\n`);
-        }
+        // Norma stops reading at finish_reason, so usage must accompany that
+        // chunk rather than arriving later in a choices:[] chunk.
+        chunk({}, output.finish_reason, body.stream_options?.include_usage ? output.usage : undefined);
         response.end('data: [DONE]\n\n');
       } else {
         json(response, 200, { ...base, object: 'chat.completion', choices: [{ index: 0,
@@ -141,14 +150,20 @@ export function createBridge({ token, bin = 'codex', home, maxConcurrent = 2,
       if (!response.destroyed) {
         const status = error.status || 502;
         // RPC errors can echo request contents. Keep upstream failures generic.
-        const message = error.status ? error.message : 'Codex request failed; check the Codex version and login';
-        const payload = { error: { message, type: status < 500 ? 'invalid_request_error' : 'api_error', code: status } };
-        if (response.headersSent) response.end(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`);
-        else json(response, status, payload);
+        const message = error.status ? error.message : 'Codex failed to complete this request';
+        const payload = { error: { message, type: status === 403 ? 'permission_error' : status < 500 ? 'invalid_request_error' : 'api_error', code: error.code || status } };
+        if (!response.headersSent && (status === 429 || status === 503)) response.setHeader('Retry-After', '5');
+        if (response.headersSent) {
+          // No clean DONE after a failed partial response. Readers that ignore
+          // SSE error objects must still observe a transport failure.
+          response.write(`data: ${JSON.stringify(payload)}\n\n`);
+          response.destroy();
+        } else json(response, status, payload);
       }
     } finally {
       clearInterval(keepalive);
-      if (acquired) active--;
+      release?.();
+      if (admittedRequest) admitted--;
       if (rpc) { workers.delete(rpc); rpc.close(); }
       if (cwd) await rm(cwd, { recursive: true, force: true }).catch(() => {});
     }

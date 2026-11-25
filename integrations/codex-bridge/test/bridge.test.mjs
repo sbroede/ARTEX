@@ -73,7 +73,7 @@ test('nonstreaming completion reports text and actual token usage', async t => {
   assert.equal(result.usage.total_tokens, 12);
 });
 
-test('streaming emits deltas, finish, separate usage, and DONE', async t => {
+test('streaming emits usage before ARTEX stops reading at finish_reason', async t => {
   const { request } = await setup(t);
   const response = await request('/v1/chat/completions', body('mock-text', { stream: true, stream_options: { include_usage: true } }));
   const stream = await response.text();
@@ -82,9 +82,34 @@ test('streaming emits deltas, finish, separate usage, and DONE', async t => {
   const chunks = data.map(JSON.parse);
   assert.equal(chunks[0].choices[0].delta.role, 'assistant');
   assert.equal(chunks.slice(1, 3).map(c => c.choices[0].delta.content).join(''), 'Hello ARTEX');
-  assert.equal(chunks.at(-2).choices[0].finish_reason, 'stop');
-  assert.deepEqual(chunks.at(-1).choices, []);
+  assert.equal(chunks.at(-1).choices[0].finish_reason, 'stop');
   assert.equal(chunks.at(-1).usage.total_tokens, 12);
+});
+
+for (const model of ['mock-before-error','mock-setup-error','mock-empty']) test(`streaming ${model} returns HTTP 502 before any success headers`, async t => {
+  const { request } = await setup(t);
+  const response = await request('/v1/chat/completions', body(model, { stream: true }));
+  assert.equal(response.status, 502);
+  assert.match(response.headers.get('content-type'), /application\/json/);
+  assert.doesNotMatch(await response.text(), /private/);
+});
+
+test('a failure after streamed text terminates the transport instead of reporting clean DONE', async t => {
+  const { request } = await setup(t);
+  const response = await request('/v1/chat/completions', body('mock-partial-error', { stream: true }));
+  assert.equal(response.status, 200);
+  await assert.rejects(response.text());
+});
+
+test('policy rejection reaches ARTEX as HTTP 403, never as a successful empty stream', async t => {
+  const { request } = await setup(t);
+  const response = await request('/v1/chat/completions', body('mock-policy', { stream: true }));
+  assert.equal(response.status, 403);
+  const result = await response.json();
+  assert.equal(result.error.code, 'cyber_policy');
+  assert.equal(result.error.type, 'permission_error');
+  assert.match(result.error.message, /cyberPolicy/);
+  assert.doesNotMatch(result.error.message, /private/);
 });
 
 for (const stream of [false, true]) test(`returns external tool calls without executing (${stream ? 'SSE' : 'JSON'})`, async t => {
@@ -127,11 +152,11 @@ test('timeout releases worker capacity', async t => {
 });
 
 test('concurrency rejects overload and a disconnect terminates Codex', async t => {
-  const { request, root, clients } = await setup(t, { timeout: 5000, maxConcurrent: 1 });
+  const { request, root, clients } = await setup(t, { timeout: 5000, maxConcurrent: 1, maxQueued: 0 });
   const abort = new AbortController();
   const pending = fetch(root + '/v1/chat/completions', { method: 'POST', signal: abort.signal,
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body('mock-slow', { stream: true })),
+    body: JSON.stringify(body('mock-partial-slow', { stream: true })),
   });
   const first = await pending;
   assert.equal((await request('/v1/chat/completions', body())).status, 429);
@@ -139,6 +164,26 @@ test('concurrency rejects overload and a disconnect terminates Codex', async t =
   await first.body.cancel().catch(() => {});
   if (!clients[0].closed) await once(clients[0], 'closed');
   assert.equal(clients[0].closed, true);
+});
+
+test('queues concurrent callers rather than rejecting normal planner/worker overlap', async t => {
+  const { request } = await setup(t, { maxConcurrent: 1, maxQueued: 3 });
+  const results = await Promise.all(Array.from({ length: 4 }, async () => {
+    const response = await request('/v1/chat/completions', body('mock-delay'));
+    assert.equal(response.status, 200);
+    return response.json();
+  }));
+  assert.equal(results.length, 4);
+  for (const result of results) assert.equal(result.choices[0].message.content, 'Hello ARTEX');
+});
+
+test('queued callers time out without spawning an extra Codex worker', async t => {
+  const { request, clients } = await setup(t, { maxConcurrent: 1, maxQueued: 1, queueTimeout: 20 });
+  const first = await request('/v1/chat/completions', body('mock-delay', { stream: true }));
+  const second = await request('/v1/chat/completions', body());
+  assert.equal(second.status, 503);
+  assert.equal(clients.length, 1);
+  await first.text();
 });
 
 test('validates credentials and tool names', () => {

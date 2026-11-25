@@ -21,11 +21,23 @@ for await (const line of createInterface({ input: process.stdin })) {
     // Deliberately notify BEFORE the turn/start response to cover the race.
     if (model === 'mock-tool') send({ id: 'tool-request', method: 'item/tool/call', params: { threadId: 'thread-1', tool: 'artex_tool_0', arguments: { query: 'example' } } });
     else if (model === 'mock-builtin') send({ id: 'approval', method: 'item/commandExecution/requestApproval', params: { threadId: 'thread-1' } });
+    else if (model === 'mock-policy') {
+      const error = { message: 'private upstream task content', codexErrorInfo: 'cyberPolicy' };
+      notify('error', { error, willRetry: false });
+      notify('turn/completed', { turn: { status: 'failed', error } });
+    }
+    else if (model === 'mock-partial-slow') notify('item/agentMessage/delta', { delta: 'Working' });
     else if (model !== 'mock-slow' && model !== 'mock-exit') {
-      notify('item/agentMessage/delta', { delta: 'Hello ' });
-      notify('item/agentMessage/delta', { delta: 'ARTEX' });
-      notify('thread/tokenUsage/updated', { tokenUsage: { total: { inputTokens: 10, outputTokens: 2, totalTokens: 12, cachedInputTokens: 3 } } });
-      notify('turn/completed', { turn: { status: model === 'mock-error' ? 'failed' : 'completed', error: { message: 'private upstream payload' } } });
+      if (!['mock-before-error', 'mock-empty'].includes(model)) {
+        notify('item/agentMessage/delta', { delta: 'Hello ' });
+        notify('item/agentMessage/delta', { delta: 'ARTEX' });
+      }
+      const finish = () => {
+        notify('thread/tokenUsage/updated', { tokenUsage: { total: { inputTokens: 10, outputTokens: 2, totalTokens: 12, cachedInputTokens: 3 } } });
+        notify('turn/completed', { turn: { status: ['mock-error','mock-before-error','mock-partial-error'].includes(model) ? 'failed' : 'completed', error: { message: 'private upstream payload' } } });
+      };
+      if (['mock-delay','mock-partial-error'].includes(model)) setTimeout(finish, 100);
+      else finish();
     }
     send({ id: m.id, result: { turn: { id: 'turn-1' } } });
     if (model === 'mock-exit') process.exit(1);

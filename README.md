@@ -66,6 +66,14 @@ docker compose logs artex | grep "Setup token"
 
 ---
 
+## ChatGPT sign-in through Codex
+
+The optional [Codex Bridge](integrations/codex-bridge/README.md) exposes a local
+OpenAI-compatible Chat Completions API backed by the official Codex app-server.
+Sign in with ChatGPT through Codex, then configure ARTEX with the bridge URL and
+its separate local API key. It supports streamed replies and ARTEX function calls.
+See the guide for setup, Docker networking and API compatibility limits.
+
 ## Multi-provider workers
 
 In **System → LLM**, configure the profiles you want to use. In **System → Settings**,
